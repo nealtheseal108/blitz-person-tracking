@@ -10,6 +10,21 @@ Privacy-first vending telemetry + live dashboard.
 - `clicked`: machine-reported button presses
 - `purchased`: transaction confirmations
 
+### Metric definitions (implemented)
+
+- `passed_by` (human body): a track is counted only after sustained evidence of a real person in `foot_traffic`:
+  - human-shape bbox filter pass
+  - confidence threshold pass
+  - minimum seen frames
+  - minimum frames inside foot-traffic zone
+  - minimum motion/displacement/path thresholds
+  - dedupe window to prevent recount on ID flicker
+- `looked_at` (head movement): a person is counted when head/face evidence is detected in consecutive frames
+  while they are **not** in active approach motion.
+- `approached` (full body movement): a person is counted when their body motion vector is moving toward the
+  machine target (`approach.min_move_px`, `approach.min_cosine`) and facing-camera evidence is present in the
+  same moment. They must also have already looked at least once. This guarantees `approached <= looked_at`.
+
 ## Run visual demo (no hardware)
 
 ```bash

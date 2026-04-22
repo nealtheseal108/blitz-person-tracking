@@ -113,12 +113,101 @@ def compute_approaching_ids(
     return out
 
 
+def clothing_histogram(frame: np.ndarray, det: Detection) -> np.ndarray | None:
+    """Torso-focused color histogram used as a lightweight clothing signature."""
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = det.x1, det.y1, det.x2, det.y2
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 - x1 < 12 or y2 - y1 < 24:
+        return None
+    bh = y2 - y1
+    ty1 = y1 + int(0.25 * bh)
+    ty2 = y1 + int(0.85 * bh)
+    roi = frame[ty1:ty2, x1:x2]
+    if roi.size == 0:
+        return None
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [24, 16], [0, 180, 0, 256])
+    cv2.normalize(hist, hist, alpha=1.0, beta=0.0, norm_type=cv2.NORM_L1)
+    return hist.flatten().astype(np.float32)
+
+
+def is_human_shape(
+    det: Detection,
+    frame_shape: tuple[int, int],
+    min_aspect_ratio: float = 0.75,
+    max_aspect_ratio: float = 4.8,
+    min_area_frac: float = 0.003,
+    max_area_frac: float = 0.55,
+) -> bool:
+    """Reject detections that don't match a standing human-like bbox shape."""
+    h, w = frame_shape[:2]
+    bw = max(1, det.x2 - det.x1)
+    bh = max(1, det.y2 - det.y1)
+    aspect = bh / float(bw)
+    area_frac = (bw * bh) / float(max(1, h * w))
+    if aspect < min_aspect_ratio or aspect > max_aspect_ratio:
+        return False
+    if area_frac < min_area_frac or area_frac > max_area_frac:
+        return False
+    return True
+
+
+def detect_upper_bodies(frame: np.ndarray) -> list[Detection]:
+    """Secondary detector for upper-half humans."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+    cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_upperbody.xml")
+    cascade = cv2.CascadeClassifier(cascade_path)
+    if cascade.empty():
+        return []
+    bodies = cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.08,
+        minNeighbors=3,
+        minSize=(36, 36),
+    )
+    out: list[Detection] = []
+    h, w = frame.shape[:2]
+    for (x, y, bw, bh) in bodies:
+        x1 = max(0, int(x - 0.10 * bw))
+        x2 = min(w, int(x + 1.10 * bw))
+        y1 = max(0, int(y - 0.06 * bh))
+        y2 = min(h, int(y + 2.10 * bh))
+        out.append(Detection(x1=x1, y1=y1, x2=x2, y2=y2, confidence=0.55))
+    return out
+
+
+def iou(a: Detection, b: Detection) -> float:
+    ax1, ay1, ax2, ay2 = a.x1, a.y1, a.x2, a.y2
+    bx1, by1, bx2, by2 = b.x1, b.y1, b.x2, b.y2
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
+    area_b = max(1, (bx2 - bx1) * (by2 - by1))
+    return inter / float(area_a + area_b - inter)
+
+
+def merge_person_detections(primary: list[Detection], secondary: list[Detection], iou_thr: float = 0.45) -> list[Detection]:
+    merged = list(primary)
+    for sd in secondary:
+        if all(iou(sd, pd) < iou_thr for pd in merged):
+            merged.append(sd)
+    return merged
+
+
 def annotate_frame(
     frame: np.ndarray,
     tracks: dict,
     funnel: FunnelTracker,
     zone_mgr: ZoneManager,
     fps: float,
+    status_map: Optional[dict[int, str]] = None,
 ) -> np.ndarray:
     out = zone_mgr.draw(frame)
 
@@ -136,7 +225,8 @@ def annotate_frame(
         # ID + funnel stage label
         stage = funnel.states.get(tid)
         stage_str = stage.stage.value.upper() if stage else "?"
-        label = f"#{tid} {stage_str}"
+        status = (status_map or {}).get(tid, stage_str)
+        label = f"#{tid} {status}"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         cv2.rectangle(out, (x1, y1 - th - 8), (x1 + tw + 6, y1), col, -1)
         cv2.putText(out, label, (x1 + 3, y1 - 4),
@@ -205,6 +295,7 @@ def main():
     zone_mgr = ZoneManager.from_config(cfg, frame_shape=(frame_h, frame_w))
 
     det_cfg = cfg.get("detector", {})
+    shape_cfg = det_cfg.get("shape_filter", {})
     detector = PersonDetector(
         weights=det_cfg.get("weights", "yolov8n.pt"),
         confidence=det_cfg.get("confidence", 0.4),
@@ -217,8 +308,10 @@ def main():
     tracker = CentroidTracker(
         max_disappeared=trk_cfg.get("max_disappeared", 30),
         max_distance=trk_cfg.get("max_distance", 120),
+        appearance_weight=trk_cfg.get("appearance_weight", 0.45),
     )
     machine_pt = transaction_target_point(zone_mgr, (frame_h, frame_w))
+    approach_cfg = cfg.get("approach", {})
 
     gaze_cfg_raw = cfg.get("gaze", {})
     gaze_detector: Optional[GazeDetector] = None
@@ -227,6 +320,10 @@ def main():
             GazeConfig(
                 enabled=True,
                 head_region_frac=gaze_cfg_raw.get("head_region_frac", 0.35),
+                min_face_size_frac=gaze_cfg_raw.get("min_face_size_frac", 0.08),
+                scale_factor=gaze_cfg_raw.get("scale_factor", 1.10),
+                min_neighbors=gaze_cfg_raw.get("min_neighbors", 2),
+                min_turn_offset_frac=gaze_cfg_raw.get("min_turn_offset_frac", 0.04),
             )
         )
 
@@ -266,6 +363,12 @@ def main():
         zone_manager=zone_mgr,
         engagement_dwell_sec=funnel_cfg.get("engagement_dwell_sec", 2.0),
         transaction_dwell_sec=funnel_cfg.get("transaction_dwell_sec", 6.0),
+        visitor_min_confidence=funnel_cfg.get("visitor_min_confidence", 0.45),
+        visitor_min_motion_px=funnel_cfg.get("visitor_min_motion_px", 10.0),
+        visitor_min_seen_frames=funnel_cfg.get("visitor_min_seen_frames", 6),
+        visitor_min_foot_traffic_frames=funnel_cfg.get("visitor_min_foot_traffic_frames", 4),
+        visitor_min_displacement_px=funnel_cfg.get("visitor_min_displacement_px", 28.0),
+        visitor_min_path_px=funnel_cfg.get("visitor_min_path_px", 42.0),
         event_sink=event_sink,
     )
 
@@ -314,22 +417,72 @@ def main():
             tick = time.time()
 
             detections = detector.detect(frame)
+            if det_cfg.get("enable_upper_body_assist", True):
+                detections = merge_person_detections(
+                    detections,
+                    detect_upper_bodies(frame),
+                    iou_thr=det_cfg.get("upper_body_merge_iou", 0.45),
+                )
+            detections = [
+                d for d in detections
+                if is_human_shape(
+                    d,
+                    frame_shape=frame.shape[:2],
+                    min_aspect_ratio=shape_cfg.get("min_aspect_ratio", 0.75),
+                    max_aspect_ratio=shape_cfg.get("max_aspect_ratio", 4.8),
+                    min_area_frac=shape_cfg.get("min_area_frac", 0.003),
+                    max_area_frac=shape_cfg.get("max_area_frac", 0.55),
+                )
+            ]
+            for d in detections:
+                d.appearance_hist = clothing_histogram(frame, d)
             # Privacy-protect footage before any writer/dashboard sees it.
             safe_frame = redact(frame, detections, privacy_cfg)
-            tracks = tracker.update(detections)
-            approaching_ids = compute_approaching_ids(tracks, machine_pt)
-            funnel.update(tracks, approaching_ids=approaching_ids)
+            tracks = tracker.update(detections, frame_shape=frame.shape[:2])
+            approaching_ids = compute_approaching_ids(
+                tracks,
+                machine_pt,
+                min_move_px=approach_cfg.get("min_move_px", 8.0),
+                min_cosine=approach_cfg.get("min_cosine", 0.55),
+            )
+            funnel.update(tracks)
 
+            looking_ids: set[int] = set()
+            facing_camera_ids: set[int] = set()
             if gaze_detector is not None:
                 for tid, t in tracks.items():
                     det = Detection(
                         x1=t.bbox[0], y1=t.bbox[1], x2=t.bbox[2], y2=t.bbox[3],
                         confidence=t.confidence,
                     )
-                    looking = gaze_detector.is_looking(frame, det)
+                    facing_camera = gaze_detector.is_looking(frame, det)
+                    if facing_camera:
+                        facing_camera_ids.add(tid)
+                    # Product rule:
+                    # LOOK = head toward camera, while NOT in active approach motion.
+                    looking = facing_camera and (tid not in approaching_ids)
                     funnel.note_glance(tid, looking)
+                    if looking:
+                        looking_ids.add(tid)
 
-            annotated = annotate_frame(safe_frame, tracks, funnel, zone_mgr, fps_smoothed)
+            for tid in approaching_ids:
+                # Approach rule:
+                # BODY moving toward camera/machine target AND facing camera.
+                if tid in facing_camera_ids:
+                    funnel.note_approach_motion(tid)
+
+            status_map: dict[int, str] = {}
+            for tid in tracks.keys():
+                if tid in approaching_ids:
+                    status_map[tid] = "APPROACHING"
+                elif tid in looking_ids:
+                    status_map[tid] = "LOOKING"
+                else:
+                    status_map[tid] = "PASSING_BY"
+
+            annotated = annotate_frame(
+                safe_frame, tracks, funnel, zone_mgr, fps_smoothed, status_map=status_map
+            )
 
             if video_writer is not None:
                 video_writer.write(annotated)

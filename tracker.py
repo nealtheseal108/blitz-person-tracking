@@ -20,6 +20,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
+import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
@@ -33,6 +34,7 @@ class Track:
     centroid: Tuple[int, int]
     foot_point: Tuple[int, int]
     confidence: float
+    appearance_hist: np.ndarray | None = None
     disappeared: int = 0
     history: List[Tuple[int, int]] = field(default_factory=list)  # foot_point trail
 
@@ -41,6 +43,12 @@ class Track:
         self.centroid = det.centroid
         self.foot_point = det.foot_point
         self.confidence = det.confidence
+        if det.appearance_hist is not None:
+            if self.appearance_hist is None:
+                self.appearance_hist = det.appearance_hist
+            else:
+                # Exponential moving average to stabilize clothing signature.
+                self.appearance_hist = 0.7 * self.appearance_hist + 0.3 * det.appearance_hist
         self.disappeared = 0
         self.history.append(det.foot_point)
         # Keep trail bounded so memory doesn't grow forever on long runs
@@ -53,6 +61,9 @@ class CentroidTracker:
         self,
         max_disappeared: int = 30,
         max_distance: float = 120.0,
+        appearance_weight: float = 0.45,
+        edge_margin_px: int = 8,
+        edge_grace_multiplier: float = 2.5,
     ):
         """
         Args:
@@ -66,6 +77,17 @@ class CentroidTracker:
         self.tracks: "OrderedDict[int, Track]" = OrderedDict()
         self.max_disappeared = max_disappeared
         self.max_distance = max_distance
+        self.appearance_weight = appearance_weight
+        self.edge_margin_px = edge_margin_px
+        self.edge_grace_multiplier = edge_grace_multiplier
+
+    def _is_near_frame_edge(self, track: Track, frame_shape: tuple[int, int] | None) -> bool:
+        if frame_shape is None:
+            return False
+        h, w = frame_shape[:2]
+        x1, y1, x2, y2 = track.bbox
+        m = self.edge_margin_px
+        return x1 <= m or y1 <= m or x2 >= (w - m) or y2 >= (h - m)
 
     def _register(self, det: Detection) -> Track:
         track = Track(
@@ -74,6 +96,7 @@ class CentroidTracker:
             centroid=det.centroid,
             foot_point=det.foot_point,
             confidence=det.confidence,
+            appearance_hist=det.appearance_hist,
             history=[det.foot_point],
         )
         self.tracks[self.next_id] = track
@@ -84,13 +107,18 @@ class CentroidTracker:
         if track_id in self.tracks:
             del self.tracks[track_id]
 
-    def update(self, detections: List[Detection]) -> Dict[int, Track]:
+    def update(
+        self, detections: List[Detection], frame_shape: tuple[int, int] | None = None
+    ) -> Dict[int, Track]:
         # No detections this frame -- age all existing tracks
         if not detections:
             stale = []
             for tid, track in self.tracks.items():
                 track.disappeared += 1
-                if track.disappeared > self.max_disappeared:
+                max_age = self.max_disappeared
+                if self._is_near_frame_edge(track, frame_shape):
+                    max_age = int(self.max_disappeared * self.edge_grace_multiplier)
+                if track.disappeared > max_age:
                     stale.append(tid)
             for tid in stale:
                 self._deregister(tid)
@@ -114,6 +142,26 @@ class CentroidTracker:
             track_pts[:, None, :] - det_pts[None, :, :], axis=2
         )
 
+        # Appearance penalty based on clothing color histogram similarity.
+        # Lower is better, range approx [0, 1].
+        if self.appearance_weight > 0:
+            app_penalty = np.zeros_like(cost, dtype=np.float32)
+            for i, tid in enumerate(track_ids):
+                th = self.tracks[tid].appearance_hist
+                if th is None:
+                    continue
+                for j, det in enumerate(detections):
+                    dh = det.appearance_hist
+                    if dh is None:
+                        continue
+                    dist = cv2.compareHist(
+                        th.astype(np.float32),
+                        dh.astype(np.float32),
+                        cv2.HISTCMP_BHATTACHARYYA,
+                    )
+                    app_penalty[i, j] = float(dist)
+            cost = cost + (self.appearance_weight * self.max_distance * app_penalty)
+
         # Gate: any pairing further than max_distance is forbidden
         cost_for_assign = cost.copy()
         cost_for_assign[cost > self.max_distance] = 1e6
@@ -135,7 +183,10 @@ class CentroidTracker:
         for tid in track_ids:
             if tid not in matched_tracks:
                 self.tracks[tid].disappeared += 1
-                if self.tracks[tid].disappeared > self.max_disappeared:
+                max_age = self.max_disappeared
+                if self._is_near_frame_edge(self.tracks[tid], frame_shape):
+                    max_age = int(self.max_disappeared * self.edge_grace_multiplier)
+                if self.tracks[tid].disappeared > max_age:
                     stale.append(tid)
         for tid in stale:
             self._deregister(tid)

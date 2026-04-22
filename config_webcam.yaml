@@ -11,19 +11,33 @@ source: 0
 output_dir: runs
 
 detector:
-  weights: yolov8n.pt
-  confidence: 0.4
+  weights: yolov8m.pt
+  confidence: 0.7
   iou: 0.5
   imgsz: 640
   device: null
+  enable_upper_body_assist: true
+  upper_body_merge_iou: 0.45
+  shape_filter:
+    min_aspect_ratio: 0.78
+    max_aspect_ratio: 4.2
+    min_area_frac: 0.004
+    max_area_frac: 0.45
 
 tracker:
   max_disappeared: 30
   max_distance: 120
+  appearance_weight: 0.55
 
 funnel:
   engagement_dwell_sec: 1.8
   transaction_dwell_sec: 4.5
+  visitor_min_confidence: 0.62
+  visitor_min_motion_px: 18.0
+  visitor_min_seen_frames: 8
+  visitor_min_foot_traffic_frames: 5
+  visitor_min_displacement_px: 34.0
+  visitor_min_path_px: 56.0
 
 output:
   write_annotated_video: true
@@ -33,6 +47,18 @@ output:
 
 privacy:
   mode: "off"
+
+gaze:
+  enabled: true
+  head_region_frac: 0.35
+  min_face_size_frac: 0.07
+  scale_factor: 1.08
+  min_neighbors: 2
+  min_turn_offset_frac: 0.035
+
+approach:
+  min_move_px: 10.0
+  min_cosine: 0.60
 
 # RGB mode needs polygon zones (not min_m/max_m distance bands).
 # Coordinates are normalized (0..1) so they scale with webcam resolution.

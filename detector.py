@@ -8,7 +8,7 @@ about ultralytics-specific result objects. Returns a clean list of
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 
@@ -23,6 +23,7 @@ class Detection:
     x2: int
     y2: int
     confidence: float
+    appearance_hist: Optional[np.ndarray] = None
 
     @property
     def centroid(self) -> tuple[int, int]:

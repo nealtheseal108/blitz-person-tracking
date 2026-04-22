@@ -44,6 +44,7 @@ import numpy as np
 
 
 _DASHBOARD_HTML_PATH = os.path.join(os.path.dirname(__file__), "dashboard.html")
+_ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
 
 
 class Dashboard:
@@ -294,6 +295,8 @@ def _make_handler(dashboard: Dashboard):
             try:
                 if self.path in ("/", "/index.html"):
                     return self._serve_dashboard()
+                if self.path.startswith("/assets/"):
+                    return self._serve_asset()
                 if self.path == "/api/summary":
                     return self._send_json(dashboard._snapshot_summary())
                 if self.path.startswith("/api/events"):
@@ -341,6 +344,36 @@ def _make_handler(dashboard: Dashboard):
                     code=500,
                 )
             return self._send_text(html, ctype="text/html")
+
+        def _serve_asset(self):
+            rel = self.path[len("/assets/"):].split("?", 1)[0]
+            rel = os.path.normpath(rel).lstrip("/\\")
+            full = os.path.normpath(os.path.join(_ASSETS_DIR, rel))
+            if not full.startswith(os.path.normpath(_ASSETS_DIR) + os.sep):
+                return self._send_text("invalid asset path", code=400)
+            if not os.path.isfile(full):
+                return self._send_text("asset not found", code=404)
+            ext = os.path.splitext(full)[1].lower()
+            ctype = {
+                ".otf": "font/otf",
+                ".ttf": "font/ttf",
+                ".woff": "font/woff",
+                ".woff2": "font/woff2",
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".svg": "image/svg+xml",
+                ".css": "text/css",
+                ".js": "application/javascript",
+            }.get(ext, "application/octet-stream")
+            with open(full, "rb") as f:
+                body = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.end_headers()
+            self.wfile.write(body)
 
         # ── Single-frame fallback (for browsers that hate MJPEG) ────────────
         def _serve_single_frame(self):
