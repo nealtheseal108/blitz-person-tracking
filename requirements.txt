@@ -1,0 +1,18 @@
+# Core (always required)
+ultralytics>=8.1.0       # YOLOv8 person detection
+opencv-python>=4.8.0     # frame I/O, tracking, gaze cascade, drawing
+numpy>=1.24.0
+pyyaml>=6.0
+scipy>=1.10.0            # Hungarian assignment in centroid tracker
+
+# ── Depth camera backends ────────────────────────────────────────────────
+# Install whichever you actually own. Both are optional -- the engine
+# only loads them on demand based on `depth.backend` in config.yaml.
+
+# Intel RealSense D435 / D455
+pyrealsense2>=2.55.1; sys_platform != "darwin" or platform_machine != "arm64"
+# ^ pyrealsense2 wheels are not published for Apple Silicon as of 2025.
+#   On M-series Macs, build from source or use an OAK-D-Lite instead.
+
+# Luxonis OAK-D-Lite / OAK-D
+depthai>=2.24.0

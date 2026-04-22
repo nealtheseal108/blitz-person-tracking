@@ -1,0 +1,84 @@
+# Telemetry engine configuration.
+#
+# This file drives both modes:
+#   telemetry_engine.py        – RGB camera (USB / IP / file) with polygon zones
+#   telemetry_engine_depth.py  – Depth camera (RealSense or OAK-D) with
+#                                distance-band zones. RGB never persisted.
+
+# ── Source for the RGB-mode engine (ignored in depth mode) ─────────────────
+source: 0          # int = USB webcam index, str = video path or RTSP URL
+output_dir: runs
+
+detector:
+  weights: yolov8n.pt
+  confidence: 0.4
+  iou: 0.5
+  imgsz: 640
+  device: null     # null = auto, "cpu", "cuda:0", "mps"
+
+tracker:
+  max_disappeared: 30
+  max_distance: 120
+
+funnel:
+  engagement_dwell_sec: 2.0
+  transaction_dwell_sec: 6.0
+
+output:
+  write_annotated_video: true
+  write_event_log: true
+  write_summary: true
+  show_window: false
+
+# ── Depth camera (RealSense / OAK-D) ───────────────────────────────────────
+# Used by telemetry_engine_depth.py. Privacy posture: RGB is captured only
+# briefly for YOLO detection, then DESTROYED before any writer touches the
+# frame. The annotated video is rendered from a colorized depth map, never
+# from RGB. Disk only ever holds depth visualizations + counters.
+depth:
+  backend: auto              # realsense | oakd | auto
+  width: 848
+  height: 480
+  fps: 30
+  min_distance_m: 0.2        # ignore detections closer than this (lens flare)
+  max_distance_m: 8.0        # ignore farther (out-of-zone, posters)
+  sample_window_px: 7        # kxk median window for depth sampling
+  viz_max_distance_m: 6.0    # color scale for the annotated video
+
+# ── Gaze ("looking at machine") ────────────────────────────────────────────
+# Uses OpenCV's bundled Haar cascade for frontal faces. A frontal face
+# inside a person's bbox => they are facing the camera, which (since the
+# camera sits on top of the machine) means they are looking at the
+# machine. No facial features are stored -- only a boolean per detection.
+gaze:
+  enabled: true
+  head_region_frac: 0.35
+
+# ── Privacy ────────────────────────────────────────────────────────────────
+# Applied to the annotated video (and to depth viz too, since silhouettes
+# can still hint at identity in some scenes).
+#   off            – no redaction (calibration only)
+#   face_blur      – heavy blur on the face region of each person bbox
+#   body_pixelate  – mosaic the entire bbox
+#   silhouette     – flat rectangle over the bbox (recommended)
+privacy:
+  mode: silhouette
+
+# ── Funnel zones ───────────────────────────────────────────────────────────
+# In depth mode use distance-band zones (min_m / max_m). Camera mounted
+# on top of the machine, so distance from camera ≈ distance from machine.
+#
+# In RGB mode, swap these for polygon entries (see calibrate.py).
+zones:
+  - name: foot_traffic
+    color: [255, 200, 0]
+    min_m: 0.6
+    max_m: 5.0
+  - name: engagement
+    color: [0, 200, 255]
+    min_m: 0.3
+    max_m: 1.0
+  - name: transaction
+    color: [0, 255, 0]
+    min_m: 0.0
+    max_m: 0.4

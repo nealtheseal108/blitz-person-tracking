@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Machine Telemetry Dashboard</title>
+  <style>
+    :root{
+      --bg:#0b1020;--panel:#121a2f;--muted:#9fb0d0;--text:#eaf0ff;--accent:#6fa8ff;
+      --good:#49d17d;--warn:#f3c15b;--danger:#ff6b6b;border-color:#223055;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;font-family:Inter,system-ui,Arial,sans-serif;background:var(--bg);color:var(--text)}
+    .wrap{max-width:1300px;margin:0 auto;padding:18px}
+    .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+    .badge{background:#1e2a49;padding:6px 10px;border-radius:999px;color:var(--muted);font-size:12px}
+    .grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin-bottom:12px}
+    .card{background:var(--panel);border:1px solid var(--border-color,#223055);border-radius:12px;padding:12px}
+    .k{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+    .v{font-size:32px;font-weight:700;line-height:1.1;margin-top:6px}
+    .layout{display:grid;grid-template-columns:2fr 1fr;gap:12px}
+    .stream{background:var(--panel);border:1px solid #223055;border-radius:12px;padding:10px}
+    img{width:100%;border-radius:8px;background:#060a16;display:block}
+    .panel{background:var(--panel);border:1px solid #223055;border-radius:12px;padding:10px}
+    .frow{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #223055}
+    .events{height:210px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+    .event{padding:4px 0;border-bottom:1px dashed #23345f;color:#cdd8f1}
+    table{width:100%;border-collapse:collapse;font-size:12px}
+    th,td{padding:7px 6px;border-bottom:1px solid #223055;text-align:left}
+    th{color:#a7b9de;font-weight:600}
+    .actions{display:flex;gap:10px;align-items:center;margin:8px 0 0}
+    button{background:var(--accent);color:white;border:0;border-radius:8px;padding:8px 12px;cursor:pointer}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <h2 style="margin:0">Vending Machine Telemetry</h2>
+      <div class="badge">Privacy mode: RGB never persisted</div>
+    </div>
+
+    <div class="grid">
+      <div class="card"><div class="k">Passed By</div><div class="v" id="m_passed_by">0</div></div>
+      <div class="card"><div class="k">Looked At</div><div class="v" id="m_looked_at">0</div></div>
+      <div class="card"><div class="k">Approached</div><div class="v" id="m_approached">0</div></div>
+      <div class="card"><div class="k">Clicked</div><div class="v" id="m_clicked">0</div></div>
+      <div class="card"><div class="k">Purchased</div><div class="v" id="m_purchased">0</div></div>
+    </div>
+
+    <div class="layout">
+      <div class="stream">
+        <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+          <strong>Live Feed</strong><span id="uptime" class="k"></span>
+        </div>
+        <img src="/stream.mjpg" alt="Live stream" />
+        <div class="actions">
+          <button id="simulate_click">Simulate Click</button>
+          <span class="k">Use this before machine wiring is ready.</span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <strong>Funnel Rates</strong>
+        <div class="frow"><span>Look / Passed</span><span id="r_look">0%</span></div>
+        <div class="frow"><span>Approach / Passed</span><span id="r_approach">0%</span></div>
+        <div class="frow"><span>Click / Approach</span><span id="r_click">0%</span></div>
+        <div class="frow"><span>Purchase / Approach</span><span id="r_purchase">0%</span></div>
+        <div class="frow"><span>Overall Conversion</span><span id="r_overall">0%</span></div>
+        <h4 style="margin:12px 0 6px">Recent Events</h4>
+        <div class="events" id="events"></div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:12px">
+      <strong>Per-Track View</strong>
+      <table id="tracks">
+        <thead><tr><th>ID</th><th>Stage</th><th>Min Dist (m)</th><th>Looks</th><th>Engage Dwell (s)</th><th>Txn Dwell (s)</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    const pct = (v) => `${(100 * (v || 0)).toFixed(1)}%`;
+    const setText = (id, value) => { document.getElementById(id).textContent = value; };
+    const esc = (s) => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+    async function refreshSummary() {
+      const s = await (await fetch('/api/summary', {cache:'no-store'})).json();
+      setText('m_passed_by', s.passed_by ?? 0);
+      setText('m_looked_at', s.looked_at ?? 0);
+      setText('m_approached', s.approached ?? 0);
+      setText('m_clicked', s.clicked ?? 0);
+      setText('m_purchased', s.purchased ?? 0);
+      setText('r_look', pct(s.look_rate));
+      setText('r_approach', pct(s.approach_rate));
+      setText('r_click', pct(s.click_rate));
+      setText('r_purchase', pct(s.purchase_rate));
+      setText('r_overall', pct(s.overall_conversion));
+      setText('uptime', `Uptime ${Math.round(s.uptime_sec || 0)}s`);
+    }
+
+    async function refreshEvents() {
+      const events = await (await fetch('/api/events', {cache:'no-store'})).json();
+      const box = document.getElementById('events');
+      box.innerHTML = events.slice(-30).reverse().map(ev => {
+        const t = new Date((ev.ts || 0) * 1000).toLocaleTimeString();
+        return `<div class="event">[${esc(t)}] ${esc(ev.event || 'event')} track=${esc(ev.track_id ?? '-')}</div>`;
+      }).join('');
+    }
+
+    async function refreshTracks() {
+      const rows = await (await fetch('/api/tracks', {cache:'no-store'})).json();
+      const tbody = document.querySelector('#tracks tbody');
+      tbody.innerHTML = rows.slice(0, 200).map(r => `
+        <tr>
+          <td>${esc(r.track_id)}</td>
+          <td>${esc(r.stage)}</td>
+          <td>${esc(r.min_distance_m ?? '')}</td>
+          <td>${esc(r.look_count ?? 0)}</td>
+          <td>${esc(r.dwell_engagement_sec ?? 0)}</td>
+          <td>${esc(r.dwell_transaction_sec ?? 0)}</td>
+        </tr>
+      `).join('');
+    }
+
+    document.getElementById('simulate_click').addEventListener('click', async () => {
+      await fetch('/api/click', {method:'POST', body:'dashboard_button'});
+      await refreshSummary();
+      await refreshEvents();
+    });
+
+    async function tick() {
+      await Promise.all([refreshSummary(), refreshEvents(), refreshTracks()]);
+    }
+    tick();
+    setInterval(tick, 1000);
+  </script>
+</body>
+</html>
