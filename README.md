@@ -56,3 +56,62 @@ Each run writes to `runs/<timestamp>/`:
 - Store counters and events, not identities
 - Redact rendered output via `privacy.mode` in `config.yaml`
 - Keep machine clicks as ground truth through `/api/click` or POS hooks
+
+## Machine and POS event contract
+
+Use `POST /api/events` for production ingestion (`click`, `purchase`).
+
+Required JSON fields:
+
+- `event_type`: `click` or `purchase`
+- `machine_id`: machine identifier
+- `idempotency_key`: unique per event (prevents double counting)
+
+Optional:
+
+- `timestamp`: ISO-8601 (`2026-04-22T20:15:02Z`)
+- `source`: e.g. `machine_ui`, `pos`
+
+Example click:
+
+```bash
+curl -X POST http://localhost:8000/api/events \
+  -H "Content-Type: application/json" \
+  -d '{
+    "event_type":"click",
+    "machine_id":"berkeley-01",
+    "idempotency_key":"click-1745341092",
+    "timestamp":"2026-04-22T20:15:02Z",
+    "source":"machine_ui"
+  }'
+```
+
+Example purchase:
+
+```bash
+curl -X POST http://localhost:8000/api/events \
+  -H "Content-Type: application/json" \
+  -d '{
+    "event_type":"purchase",
+    "machine_id":"berkeley-01",
+    "idempotency_key":"txn-9f2d5a",
+    "timestamp":"2026-04-22T20:15:07Z",
+    "source":"pos"
+  }'
+```
+
+### API auth (recommended)
+
+Set an API token before starting the engine:
+
+```bash
+export MACHINE_API_TOKEN="replace-with-secret"
+```
+
+Then clients send:
+
+```bash
+-H "Authorization: Bearer replace-with-secret"
+```
+
+If `MACHINE_API_TOKEN` is unset, `/api/events` is open for local testing.

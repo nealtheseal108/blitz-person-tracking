@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import signal
 import threading
 import sys
@@ -214,7 +215,10 @@ def main():
     )
 
     if args.dashboard:
-        dashboard = Dashboard(funnel=funnel)
+        dashboard = Dashboard(
+            funnel=funnel,
+            machine_api_token=os.getenv("MACHINE_API_TOKEN"),
+        )
         dashboard.set_click_handler(lambda source: funnel.note_click(source))
         dashboard.start(host=args.dashboard_host, port=args.dashboard_port)
         print(f"[telemetry] dashboard live at http://{args.dashboard_host}:{args.dashboard_port}/")

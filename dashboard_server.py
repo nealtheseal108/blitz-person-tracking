@@ -13,6 +13,7 @@ GET  /api/summary       -> JSON funnel summary (current snapshot)
 GET  /api/events        -> JSON list of last N events
 GET  /api/tracks        -> JSON per-track rows (for the table)
 POST /api/click         -> increment clicked counter (for testing)
+POST /api/events        -> ingest machine/POS click and purchase events
 
 Usage
 ─────
@@ -34,6 +35,7 @@ import os
 import threading
 import time
 from collections import deque
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Deque, Optional
 
@@ -45,9 +47,17 @@ _DASHBOARD_HTML_PATH = os.path.join(os.path.dirname(__file__), "dashboard.html")
 
 
 class Dashboard:
-    def __init__(self, funnel=None, max_events: int = 200, jpeg_quality: int = 80):
+    def __init__(
+        self,
+        funnel=None,
+        max_events: int = 200,
+        jpeg_quality: int = 80,
+        machine_api_token: Optional[str] = None,
+        max_idempotency_keys: int = 5000,
+    ):
         self.funnel = funnel  # FunnelTracker or None; used for /api/* snapshots
         self.jpeg_quality = jpeg_quality
+        self.machine_api_token = machine_api_token
 
         # Latest annotated frame as JPEG bytes + a condition var so the
         # MJPEG endpoint can wake on each new frame instead of polling.
@@ -58,6 +68,9 @@ class Dashboard:
         # Recent events (for the ticker)
         self._events: Deque[dict] = deque(maxlen=max_events)
         self._events_lock = threading.Lock()
+        self._idempotency_keys: Deque[str] = deque(maxlen=max_idempotency_keys)
+        self._idempotency_set: set[str] = set()
+        self._idem_lock = threading.Lock()
 
         # Optional click sink (e.g. funnel.note_click) for the test button
         self._on_click: Optional[Callable[[str], None]] = None
@@ -144,6 +157,107 @@ class Dashboard:
         if self._on_click is not None:
             self._on_click(source)
 
+    def _is_authorized(self, auth_header: str) -> bool:
+        # If no token is configured, allow local/manual testing by default.
+        if not self.machine_api_token:
+            return True
+        return auth_header == f"Bearer {self.machine_api_token}"
+
+    def _remember_idempotency_key(self, key: str) -> bool:
+        """Returns True if key is new, False if duplicate."""
+        with self._idem_lock:
+            if key in self._idempotency_set:
+                return False
+            if len(self._idempotency_keys) == self._idempotency_keys.maxlen:
+                old = self._idempotency_keys.popleft()
+                self._idempotency_set.discard(old)
+            self._idempotency_keys.append(key)
+            self._idempotency_set.add(key)
+            return True
+
+    def ingest_machine_event(self, payload: dict, auth_header: str = "") -> tuple[int, dict]:
+        """Ingest click/purchase events from machine or POS.
+
+        Contract:
+            {
+              "event_type": "click" | "purchase",
+              "machine_id": "berkeley-unit-01",
+              "timestamp": "2026-04-22T20:15:02Z",   # optional
+              "idempotency_key": "txn_12345",        # required for prod
+              "source": "machine_ui" | "pos"         # optional
+            }
+        """
+        if not self._is_authorized(auth_header):
+            return 401, {"ok": False, "error": "unauthorized"}
+
+        event_type = str(payload.get("event_type", "")).strip().lower()
+        machine_id = str(payload.get("machine_id", "")).strip()
+        source = str(payload.get("source", "")).strip() or "machine"
+        idem = str(payload.get("idempotency_key", "")).strip()
+        ts = str(payload.get("timestamp", "")).strip()
+
+        if event_type not in {"click", "purchase"}:
+            return 400, {"ok": False, "error": "event_type must be click or purchase"}
+        if not machine_id:
+            return 400, {"ok": False, "error": "machine_id is required"}
+        if not idem:
+            return 400, {"ok": False, "error": "idempotency_key is required"}
+        if ts:
+            try:
+                datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
+            except ValueError:
+                return 400, {"ok": False, "error": "timestamp must be ISO-8601"}
+
+        if not self._remember_idempotency_key(idem):
+            return 200, {"ok": True, "duplicate": True, "event_type": event_type}
+
+        if self.funnel is None:
+            return 503, {"ok": False, "error": "funnel unavailable"}
+
+        if event_type == "click":
+            self.funnel.note_click(source=source)
+            self.publish_event({
+                "ts": time.time(),
+                "event": "click_ingested",
+                "machine_id": machine_id,
+                "idempotency_key": idem,
+                "source": source,
+            })
+            return 200, {"ok": True, "event_type": "click", "duplicate": False}
+
+        # purchase path
+        track_id = self.funnel.confirm_most_recent_engaged(source=source)
+        if track_id is None:
+            self.publish_event({
+                "ts": time.time(),
+                "event": "purchase_unattributed",
+                "machine_id": machine_id,
+                "idempotency_key": idem,
+                "source": source,
+            })
+            return 202, {
+                "ok": True,
+                "event_type": "purchase",
+                "duplicate": False,
+                "attributed": False,
+                "track_id": None,
+            }
+        self.publish_event({
+            "ts": time.time(),
+            "event": "purchase_ingested",
+            "machine_id": machine_id,
+            "idempotency_key": idem,
+            "source": source,
+            "track_id": track_id,
+        })
+        return 200, {
+            "ok": True,
+            "event_type": "purchase",
+            "duplicate": False,
+            "attributed": True,
+            "track_id": track_id,
+        }
+
 
 def _make_handler(dashboard: Dashboard):
     """Build a request handler class bound to the given Dashboard instance.
@@ -202,6 +316,18 @@ def _make_handler(dashboard: Dashboard):
                 source = body[:64] if body else "dashboard_button"
                 dashboard._trigger_click(source)
                 return self._send_json({"ok": True, "source": source})
+            if self.path == "/api/events":
+                length = int(self.headers.get("content-length", 0) or 0)
+                raw = self.rfile.read(length).decode("utf-8", "ignore") if length else "{}"
+                try:
+                    payload = json.loads(raw or "{}")
+                except json.JSONDecodeError:
+                    return self._send_json({"ok": False, "error": "invalid JSON"}, code=400)
+                code, resp = dashboard.ingest_machine_event(
+                    payload=payload,
+                    auth_header=self.headers.get("Authorization", ""),
+                )
+                return self._send_json(resp, code=code)
             self.send_error(404, "not found")
 
         # ── Dashboard HTML ──────────────────────────────────────────────────
