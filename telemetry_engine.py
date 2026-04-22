@@ -102,9 +102,9 @@ def annotate_frame(
     summary = funnel.summary()
     hud_lines = [
         f"FPS: {fps:5.1f}",
-        f"Visitors:  {summary['visitors']}",
-        f"Engaged:   {summary['engaged']}  ({summary['engagement_rate']*100:5.1f}%)",
-        f"Converted: {summary['converted']} ({summary['purchase_rate_given_engaged']*100:5.1f}%)",
+        f"Passed By: {summary['passed_by']}",
+        f"Approached: {summary['approached']}  ({summary['approach_rate']*100:5.1f}%)",
+        f"Purchased: {summary['purchased']} ({summary['purchase_rate']*100:5.1f}%)",
         f"Overall:   {summary['overall_conversion']*100:5.1f}%",
     ]
     pad = 8

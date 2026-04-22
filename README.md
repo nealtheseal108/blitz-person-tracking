@@ -41,6 +41,20 @@ Optional preview window:
 python telemetry_engine.py --config config.yaml --dashboard --show
 ```
 
+## Run with your computer webcam (real feed)
+
+Use `config_webcam.yaml` for local testing. It uses polygon zones sized for a
+top-mounted-machine layout (machine on right side of frame).
+
+```bash
+python telemetry_engine.py --config config_webcam.yaml --dashboard --show
+```
+
+Then open `http://localhost:8000/`.
+
+If your machine appears on a different side in frame, update the polygons in
+`config_webcam.yaml` to match your camera angle.
+
 ## Outputs
 
 Each run writes to `runs/<timestamp>/`:

@@ -1,0 +1,62 @@
+# Local webcam configuration (RGB mode) for top-mounted camera simulation.
+# Use this when testing on your computer webcam.
+#
+# Assumption:
+# - Camera is physically above/near the machine, pointing outward at people.
+# - Machine is roughly on the RIGHT side of frame.
+#
+# Tune the polygons after first run to match your physical setup.
+
+source: 0
+output_dir: runs
+
+detector:
+  weights: yolov8n.pt
+  confidence: 0.4
+  iou: 0.5
+  imgsz: 640
+  device: null
+
+tracker:
+  max_disappeared: 30
+  max_distance: 120
+
+funnel:
+  engagement_dwell_sec: 1.8
+  transaction_dwell_sec: 4.5
+
+output:
+  write_annotated_video: true
+  write_event_log: true
+  write_summary: true
+  show_window: false
+
+privacy:
+  mode: silhouette
+
+# RGB mode needs polygon zones (not min_m/max_m distance bands).
+# Coordinates are normalized (0..1) so they scale with webcam resolution.
+zones:
+  - name: foot_traffic
+    color: [255, 200, 0]
+    polygon:
+      - [0.00, 0.28]
+      - [1.00, 0.28]
+      - [1.00, 1.00]
+      - [0.00, 1.00]
+
+  - name: engagement
+    color: [0, 200, 255]
+    polygon:
+      - [0.62, 0.36]
+      - [0.98, 0.36]
+      - [0.98, 1.00]
+      - [0.56, 1.00]
+
+  - name: transaction
+    color: [0, 255, 0]
+    polygon:
+      - [0.74, 0.42]
+      - [0.95, 0.42]
+      - [0.95, 1.00]
+      - [0.70, 1.00]
