@@ -12,14 +12,6 @@ from typing import List
 
 import numpy as np
 
-try:
-    from ultralytics import YOLO
-except ImportError as e:  # pragma: no cover
-    raise ImportError(
-        "ultralytics is required. Install with: pip install ultralytics"
-    ) from e
-
-
 # COCO class index for "person"
 PERSON_CLASS_ID = 0
 
@@ -56,6 +48,13 @@ class PersonDetector:
         imgsz: int = 640,
         verbose: bool = False,
     ):
+        try:
+            from ultralytics import YOLO
+        except ImportError as e:  # pragma: no cover
+            raise ImportError(
+                "ultralytics is required for PersonDetector. "
+                "Install with: pip install ultralytics"
+            ) from e
         self.model = YOLO(weights)
         self.confidence = confidence
         self.iou = iou
