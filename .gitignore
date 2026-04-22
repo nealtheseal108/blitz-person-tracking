@@ -6,3 +6,4 @@ venv/
 .env
 runs/
 yolov8*.pt
+Ultralytics/

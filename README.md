@@ -19,6 +19,16 @@ python demo_synthetic.py --port 8000
 
 Open `http://localhost:8000/`.
 
+## Integrated verification (your two checklist items)
+
+This validates both:
+- synthetic end-to-end pipeline behavior
+- `config.yaml` + `README.md` privacy/sensor alignment
+
+```bash
+python3 verify_integration.py
+```
+
 ## Run camera pipeline + dashboard
 
 ```bash
