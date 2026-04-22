@@ -9,7 +9,9 @@ Then open:
 from __future__ import annotations
 
 import argparse
+import os
 import time
+import traceback
 
 import cv2
 import numpy as np
@@ -78,7 +80,7 @@ def render_scene(frame_idx: int, tracks: dict[int, Track], distances: dict[int, 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")))
     args = parser.parse_args()
 
     funnel = build_funnel()
@@ -137,4 +139,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception:
+        # Render only shows process exit by default; print traceback so
+        # deployment logs include the actual startup failure reason.
+        traceback.print_exc()
+        raise
