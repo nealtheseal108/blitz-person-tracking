@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import signal
 import threading
@@ -35,8 +36,10 @@ import cv2
 import numpy as np
 import yaml
 
-from detector import PersonDetector
+from detector import Detection, PersonDetector
 from funnel import FunnelStage, FunnelTracker
+from gaze import GazeConfig, GazeDetector
+from privacy import PrivacyConfig, redact
 from tracker import CentroidTracker
 from zones import ZoneManager
 from dashboard_server import Dashboard
@@ -67,6 +70,47 @@ _TRACK_COLORS = [
 
 def color_for(track_id: int) -> tuple:
     return _TRACK_COLORS[track_id % len(_TRACK_COLORS)]
+
+
+def transaction_target_point(zone_mgr: ZoneManager, frame_shape: tuple[int, int]) -> tuple[int, int]:
+    """Best-effort machine target point used for approach-motion detection."""
+    z = zone_mgr.zones.get(ZoneManager.TRANSACTION)
+    if hasattr(z, "polygon"):
+        poly = getattr(z, "polygon")
+        cx = int(np.mean(poly[:, 0]))
+        cy = int(np.mean(poly[:, 1]))
+        return cx, cy
+    # Fallback for non-polygon zones
+    h, w = frame_shape[:2]
+    return int(0.85 * w), int(0.75 * h)
+
+
+def compute_approaching_ids(
+    tracks: dict,
+    machine_pt: tuple[int, int],
+    min_move_px: float = 8.0,
+    min_cosine: float = 0.55,
+) -> set[int]:
+    """Track ids actively moving toward machine target."""
+    out: set[int] = set()
+    mx, my = machine_pt
+    for tid, t in tracks.items():
+        if len(t.history) < 4:
+            continue
+        x0, y0 = t.history[-4]
+        x1, y1 = t.history[-1]
+        mvx, mvy = (x1 - x0), (y1 - y0)
+        move_mag = math.hypot(mvx, mvy)
+        if move_mag < min_move_px:
+            continue
+        tx, ty = (mx - x1), (my - y1)
+        target_mag = math.hypot(tx, ty)
+        if target_mag < 1e-6:
+            continue
+        cosine = (mvx * tx + mvy * ty) / (move_mag * target_mag)
+        if cosine >= min_cosine:
+            out.add(tid)
+    return out
 
 
 def annotate_frame(
@@ -174,6 +218,17 @@ def main():
         max_disappeared=trk_cfg.get("max_disappeared", 30),
         max_distance=trk_cfg.get("max_distance", 120),
     )
+    machine_pt = transaction_target_point(zone_mgr, (frame_h, frame_w))
+
+    gaze_cfg_raw = cfg.get("gaze", {})
+    gaze_detector: Optional[GazeDetector] = None
+    if gaze_cfg_raw.get("enabled", True):
+        gaze_detector = GazeDetector(
+            GazeConfig(
+                enabled=True,
+                head_region_frac=gaze_cfg_raw.get("head_region_frac", 0.35),
+            )
+        )
 
     # ── Set up output directory + writers ─────────────────────────────────
     out_root = Path(cfg.get("output_dir", "runs"))
@@ -214,6 +269,19 @@ def main():
         event_sink=event_sink,
     )
 
+    priv_cfg_raw = cfg.get("privacy", {})
+    mode_raw = priv_cfg_raw.get("mode", "silhouette")
+    # YAML 1.1 treats bare "off" as boolean false, so normalize that case.
+    if isinstance(mode_raw, bool):
+        mode = "off" if mode_raw is False else "silhouette"
+    else:
+        mode = str(mode_raw)
+    privacy_cfg = PrivacyConfig(
+        mode=mode,
+        blur_kernel=priv_cfg_raw.get("blur_kernel", 51),
+        pixelate_blocks=priv_cfg_raw.get("pixelate_blocks", 12),
+    )
+
     if args.dashboard:
         dashboard = Dashboard(
             funnel=funnel,
@@ -246,10 +314,22 @@ def main():
             tick = time.time()
 
             detections = detector.detect(frame)
+            # Privacy-protect footage before any writer/dashboard sees it.
+            safe_frame = redact(frame, detections, privacy_cfg)
             tracks = tracker.update(detections)
-            funnel.update(tracks)
+            approaching_ids = compute_approaching_ids(tracks, machine_pt)
+            funnel.update(tracks, approaching_ids=approaching_ids)
 
-            annotated = annotate_frame(frame, tracks, funnel, zone_mgr, fps_smoothed)
+            if gaze_detector is not None:
+                for tid, t in tracks.items():
+                    det = Detection(
+                        x1=t.bbox[0], y1=t.bbox[1], x2=t.bbox[2], y2=t.bbox[3],
+                        confidence=t.confidence,
+                    )
+                    looking = gaze_detector.is_looking(frame, det)
+                    funnel.note_glance(tid, looking)
+
+            annotated = annotate_frame(safe_frame, tracks, funnel, zone_mgr, fps_smoothed)
 
             if video_writer is not None:
                 video_writer.write(annotated)

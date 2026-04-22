@@ -106,6 +106,7 @@ class FunnelTracker:
         # Aggregate-only counters (no per-person retention required)
         self.unique_lookers: int = 0   # unique track ids that ever looked
         self.click_count: int = 0      # button presses reported by the machine
+        self.approached_ids: set[int] = set()  # active motion toward machine
 
     def _emit(self, event_type: str, state: FunnelState, **extra) -> None:
         ev = {
@@ -122,6 +123,7 @@ class FunnelTracker:
         tracks: Dict[int, Track],
         now: Optional[float] = None,
         distances_m: Optional[Dict[int, float]] = None,
+        approaching_ids: Optional[set[int]] = None,
     ) -> None:
         """Call once per frame with the current set of tracks.
 
@@ -133,6 +135,7 @@ class FunnelTracker:
         dt = 0.0 if self._last_update_ts is None else max(0.0, now - self._last_update_ts)
         self._last_update_ts = now
         distances_m = distances_m or {}
+        approaching_ids = approaching_ids or set()
 
         active_ids = set(tracks.keys())
 
@@ -157,6 +160,10 @@ class FunnelTracker:
 
             state = self.states[tid]
             state.last_seen_ts = now
+
+            if tid in approaching_ids and tid not in self.approached_ids:
+                self.approached_ids.add(tid)
+                self._emit("approach_motion", state)
 
             # Track distance metrics (NaN-safe min)
             if d is not None and d == d:  # not NaN
@@ -288,16 +295,19 @@ class FunnelTracker:
         c = self.totals[FunnelStage.CONVERTED]
         ul = self.unique_lookers
         clicks = self.click_count
+        # If motion-based approach detection is wired, use it; otherwise
+        # fall back to ENGAGED for backward compatibility.
+        approached = len(self.approached_ids) if self.approached_ids else e
         return {
             "passed_by": v,
             "looked_at": ul,
-            "approached": e,
+            "approached": approached,
             "clicked": clicks,
             "purchased": c,
             "look_rate":        round(ul / v, 4) if v else 0.0,    # of passed-by
-            "approach_rate":    round(e / v, 4) if v else 0.0,
-            "click_rate":       round(clicks / e, 4) if e else 0.0,  # of approached
-            "purchase_rate":    round(c / e, 4) if e else 0.0,
+            "approach_rate":    round(approached / v, 4) if v else 0.0,
+            "click_rate":       round(clicks / approached, 4) if approached else 0.0,
+            "purchase_rate":    round(c / approached, 4) if approached else 0.0,
             "overall_conversion": round(c / v, 4) if v else 0.0,
         }
 

@@ -32,7 +32,7 @@ output:
   show_window: false
 
 privacy:
-  mode: silhouette
+  mode: "off"
 
 # RGB mode needs polygon zones (not min_m/max_m distance bands).
 # Coordinates are normalized (0..1) so they scale with webcam resolution.

@@ -55,6 +55,7 @@
         <img src="/stream.mjpg" alt="Live stream" />
         <div class="actions">
           <button id="simulate_click">Simulate Click</button>
+          <button id="simulate_purchase">Simulate Purchase</button>
           <span class="k">Use this before machine wiring is ready.</span>
         </div>
       </div>
@@ -124,8 +125,29 @@
       `).join('');
     }
 
+    async function sendMachineEvent(eventType) {
+      const now = Date.now();
+      const payload = {
+        event_type: eventType,
+        machine_id: "dashboard-demo",
+        idempotency_key: `${eventType}-${now}`,
+        source: "dashboard_button",
+      };
+      await fetch('/api/events', {
+        method:'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(payload),
+      });
+    }
+
     document.getElementById('simulate_click').addEventListener('click', async () => {
-      await fetch('/api/click', {method:'POST', body:'dashboard_button'});
+      await sendMachineEvent('click');
+      await refreshSummary();
+      await refreshEvents();
+    });
+
+    document.getElementById('simulate_purchase').addEventListener('click', async () => {
+      await sendMachineEvent('purchase');
       await refreshSummary();
       await refreshEvents();
     });
