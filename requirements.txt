@@ -1,9 +1,10 @@
 # Core (always required)
-ultralytics>=8.1.0       # YOLOv8 person detection
-opencv-python>=4.8.0     # frame I/O, tracking, gaze cascade, drawing
+ultralytics>=8.1.0       # YOLOv8 person detection (depth mode)
+opencv-python>=4.8.0     # frame I/O, tracking, drawing
 numpy>=1.24.0
 pyyaml>=6.0
 scipy>=1.10.0            # Hungarian assignment in centroid tracker
+mediapipe>=0.10.0        # face-only pipeline: Face Mesh + yaw estimation
 
 # ── Depth camera backends ────────────────────────────────────────────────
 # Install whichever you actually own. Both are optional -- the engine

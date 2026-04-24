@@ -11,18 +11,19 @@ output_dir: runs
 
 detector:
   weights: yolov8n.pt
-  confidence: 0.4
+  confidence: 0.35
+  use_pose: false     # pose supplement disabled — too noisy indoors
   iou: 0.5
   imgsz: 640
   device: null     # null = auto, "cpu", "cuda:0", "mps"
 
 tracker:
-  max_disappeared: 30
-  max_distance: 120
+  max_disappeared: 1     # box dies within 1 frame of person leaving
+  max_distance: 200
 
 funnel:
   engagement_dwell_sec: 2.0
-  transaction_dwell_sec: 6.0
+  transaction_dwell_sec: 999999  # purchases are manual-only (dashboard button)
 
 output:
   write_annotated_video: true
@@ -62,7 +63,7 @@ gaze:
 #   body_pixelate  – mosaic the entire bbox
 #   silhouette     – flat rectangle over the bbox (recommended)
 privacy:
-  mode: silhouette
+  mode: "off"        # "off" = no redaction (use silhouette/face_blur/body_pixelate for deployment)
 
 # ── Funnel zones ───────────────────────────────────────────────────────────
 # In depth mode use distance-band zones (min_m / max_m). Camera mounted
@@ -70,15 +71,17 @@ privacy:
 #
 # In RGB mode, swap these for polygon entries (see calibrate.py).
 zones:
+  # Zones are nested: transaction ⊂ engagement ⊂ foot_traffic
+  # Anyone the camera can detect (>= min_distance_m) falls into foot_traffic.
   - name: foot_traffic
     color: [255, 200, 0]
-    min_m: 0.6
+    min_m: 0.2        # matches depth.min_distance_m so every detection is a candidate
     max_m: 5.0
   - name: engagement
     color: [0, 200, 255]
-    min_m: 0.3
-    max_m: 1.0
+    min_m: 0.2
+    max_m: 1.0        # within 1m = person is at the machine
   - name: transaction
     color: [0, 255, 0]
-    min_m: 0.0
-    max_m: 0.4
+    min_m: 0.2
+    max_m: 0.5        # within 0.5m = person is at the touchscreen

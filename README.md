@@ -13,6 +13,7 @@ Privacy-first vending telemetry + live dashboard.
 ### Metric definitions (implemented)
 
 - `passed_by` (human body): a track is counted only after sustained evidence of a real person in `foot_traffic`:
+  - strict human filter (face/upper-body evidence, or high-confidence fallback)
   - human-shape bbox filter pass
   - confidence threshold pass
   - minimum seen frames
@@ -21,9 +22,19 @@ Privacy-first vending telemetry + live dashboard.
   - dedupe window to prevent recount on ID flicker
 - `looked_at` (head movement): a person is counted when head/face evidence is detected in consecutive frames
   while they are **not** in active approach motion.
+- `attention_intent`: broader attention proxy (industry-style stable metric). Uses head/face evidence and, when
+  available, MediaPipe head-pose yaw. `looked_at` is a strict subset of this.
 - `approached` (full body movement): a person is counted when their body motion vector is moving toward the
   machine target (`approach.min_move_px`, `approach.min_cosine`) and facing-camera evidence is present in the
   same moment. They must also have already looked at least once. This guarantees `approached <= looked_at`.
+
+Optional upgrade for head-pose yaw:
+
+```bash
+pip install mediapipe
+```
+
+If unavailable, the app falls back automatically to cascade-based head/face evidence.
 
 ## Run visual demo (no hardware)
 
@@ -60,6 +71,7 @@ python telemetry_engine.py --config config.yaml --dashboard --show
 
 Use `config_webcam.yaml` for local testing. It uses polygon zones sized for a
 top-mounted-machine layout (machine on right side of frame).
+The default webcam config is tuned for responsiveness (`yolov8n`, frame-skipped inference).
 
 ```bash
 python telemetry_engine.py --config config_webcam.yaml --dashboard --show

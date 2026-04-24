@@ -11,23 +11,32 @@ source: 0
 output_dir: runs
 
 detector:
-  weights: yolov8m.pt
-  confidence: 0.7
+  weights: yolov8n.pt
+  confidence: 0.58
   iou: 0.5
-  imgsz: 640
+  imgsz: 320
   device: null
-  enable_upper_body_assist: true
+  enable_upper_body_assist: false
   upper_body_merge_iou: 0.45
   shape_filter:
     min_aspect_ratio: 0.78
     max_aspect_ratio: 4.2
     min_area_frac: 0.004
     max_area_frac: 0.45
+  human_filter:
+    enabled: false
+    min_confidence: 0.60
+    high_confidence_fallback: 0.84
+  motion_filter:
+    enabled: true
+    pixel_delta_threshold: 18
+    min_motion_pixels: 40
+    min_motion_ratio: 0.012
 
 tracker:
   max_disappeared: 30
   max_distance: 120
-  appearance_weight: 0.55
+  appearance_weight: 0.30
 
 funnel:
   engagement_dwell_sec: 1.8
@@ -40,7 +49,7 @@ funnel:
   visitor_min_path_px: 56.0
 
 output:
-  write_annotated_video: true
+  write_annotated_video: false
   write_event_log: true
   write_summary: true
   show_window: false
@@ -51,14 +60,22 @@ privacy:
 gaze:
   enabled: true
   head_region_frac: 0.35
-  min_face_size_frac: 0.07
+  min_face_size_frac: 0.06
   scale_factor: 1.08
-  min_neighbors: 2
+  min_neighbors: 1
   min_turn_offset_frac: 0.035
+  use_mediapipe_headpose: true
+  strict_yaw_deg: 16.0
+  attention_yaw_deg: 32.0
 
 approach:
-  min_move_px: 10.0
-  min_cosine: 0.60
+  min_move_px: 7.0
+  min_cosine: 0.45
+
+runtime:
+  infer_every_n_frames: 1
+  upper_body_every_n_frames: 3
+  gaze_every_n_frames: 3
 
 # RGB mode needs polygon zones (not min_m/max_m distance bands).
 # Coordinates are normalized (0..1) so they scale with webcam resolution.

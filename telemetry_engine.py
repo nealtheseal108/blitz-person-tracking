@@ -66,6 +66,9 @@ _TRACK_COLORS = [
     (218, 112, 214), (255, 140, 0), (0, 206, 209), (220, 20, 60),
     (154, 205, 50), (138, 43, 226),
 ]
+_UPPER_BODY_CASCADE: cv2.CascadeClassifier | None = None
+_FRONTAL_FACE_CASCADE: cv2.CascadeClassifier | None = None
+_PROFILE_FACE_CASCADE: cv2.CascadeClassifier | None = None
 
 
 def color_for(track_id: int) -> tuple:
@@ -156,13 +159,15 @@ def is_human_shape(
 
 def detect_upper_bodies(frame: np.ndarray) -> list[Detection]:
     """Secondary detector for upper-half humans."""
+    global _UPPER_BODY_CASCADE
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
-    cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_upperbody.xml")
-    cascade = cv2.CascadeClassifier(cascade_path)
-    if cascade.empty():
+    if _UPPER_BODY_CASCADE is None:
+        cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_upperbody.xml")
+        _UPPER_BODY_CASCADE = cv2.CascadeClassifier(cascade_path)
+    if _UPPER_BODY_CASCADE is None or _UPPER_BODY_CASCADE.empty():
         return []
-    bodies = cascade.detectMultiScale(
+    bodies = _UPPER_BODY_CASCADE.detectMultiScale(
         gray,
         scaleFactor=1.08,
         minNeighbors=3,
@@ -177,6 +182,112 @@ def detect_upper_bodies(frame: np.ndarray) -> list[Detection]:
         y2 = min(h, int(y + 2.10 * bh))
         out.append(Detection(x1=x1, y1=y1, x2=x2, y2=y2, confidence=0.55))
     return out
+
+
+def _load_face_cascades() -> tuple[cv2.CascadeClassifier | None, cv2.CascadeClassifier | None]:
+    global _FRONTAL_FACE_CASCADE, _PROFILE_FACE_CASCADE
+    if _FRONTAL_FACE_CASCADE is None:
+        _FRONTAL_FACE_CASCADE = cv2.CascadeClassifier(
+            os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+        )
+    if _PROFILE_FACE_CASCADE is None:
+        _PROFILE_FACE_CASCADE = cv2.CascadeClassifier(
+            os.path.join(cv2.data.haarcascades, "haarcascade_profileface.xml")
+        )
+    if _FRONTAL_FACE_CASCADE is not None and _FRONTAL_FACE_CASCADE.empty():
+        _FRONTAL_FACE_CASCADE = None
+    if _PROFILE_FACE_CASCADE is not None and _PROFILE_FACE_CASCADE.empty():
+        _PROFILE_FACE_CASCADE = None
+    return _FRONTAL_FACE_CASCADE, _PROFILE_FACE_CASCADE
+
+
+def has_face_evidence(frame: np.ndarray, det: Detection) -> bool:
+    frontal, profile = _load_face_cascades()
+    if frontal is None and profile is None:
+        return False
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = max(0, det.x1), max(0, det.y1), min(w, det.x2), min(h, det.y2)
+    if x2 - x1 < 18 or y2 - y1 < 24:
+        return False
+    head_h = max(16, int((y2 - y1) * 0.42))
+    roi = frame[y1:y1 + head_h, x1:x2]
+    if roi.size == 0:
+        return False
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+    min_side = max(14, int((x2 - x1) * 0.08))
+    if frontal is not None:
+        faces = frontal.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=2, minSize=(min_side, min_side))
+        if len(faces) > 0:
+            return True
+    if profile is not None:
+        p1 = profile.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=2, minSize=(min_side, min_side))
+        if len(p1) > 0:
+            return True
+        flipped = cv2.flip(gray, 1)
+        p2 = profile.detectMultiScale(flipped, scaleFactor=1.12, minNeighbors=2, minSize=(min_side, min_side))
+        if len(p2) > 0:
+            return True
+    return False
+
+
+def has_upper_body_evidence(frame: np.ndarray, det: Detection) -> bool:
+    global _UPPER_BODY_CASCADE
+    if _UPPER_BODY_CASCADE is None:
+        _UPPER_BODY_CASCADE = cv2.CascadeClassifier(
+            os.path.join(cv2.data.haarcascades, "haarcascade_upperbody.xml")
+        )
+    if _UPPER_BODY_CASCADE is None or _UPPER_BODY_CASCADE.empty():
+        return False
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = max(0, det.x1), max(0, det.y1), min(w, det.x2), min(h, det.y2)
+    if x2 - x1 < 20 or y2 - y1 < 28:
+        return False
+    roi = frame[y1:y2, x1:x2]
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+    ub = _UPPER_BODY_CASCADE.detectMultiScale(gray, scaleFactor=1.10, minNeighbors=2, minSize=(24, 24))
+    return len(ub) > 0
+
+
+def strict_human_filter(frame: np.ndarray, det: Detection, cfg: dict) -> bool:
+    """Hard filter: keep only detections with human evidence."""
+    if not cfg.get("enabled", False):
+        return True
+    if det.confidence < float(cfg.get("min_confidence", 0.55)):
+        return False
+    # First-class evidence checks.
+    face_ok = has_face_evidence(frame, det)
+    upper_ok = has_upper_body_evidence(frame, det)
+    if face_ok or upper_ok:
+        return True
+    # Fallback: very high-confidence, human-shape boxes only.
+    return det.confidence >= float(cfg.get("high_confidence_fallback", 0.82))
+
+
+def motion_evidence_filter(
+    det: Detection,
+    motion_mask: np.ndarray | None,
+    cfg: dict,
+) -> bool:
+    """Require actual motion pixels inside bbox to keep detection."""
+    if not cfg.get("enabled", True):
+        return True
+    if motion_mask is None:
+        return True
+    h, w = motion_mask.shape[:2]
+    x1, y1 = max(0, det.x1), max(0, det.y1)
+    x2, y2 = min(w, det.x2), min(h, det.y2)
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return False
+    roi = motion_mask[y1:y2, x1:x2]
+    moving = int(cv2.countNonZero(roi))
+    total = max(1, roi.shape[0] * roi.shape[1])
+    ratio = moving / float(total)
+    return (
+        moving >= int(cfg.get("min_motion_pixels", 30))
+        and ratio >= float(cfg.get("min_motion_ratio", 0.01))
+    )
 
 
 def iou(a: Detection, b: Detection) -> float:
@@ -201,6 +312,23 @@ def merge_person_detections(primary: list[Detection], secondary: list[Detection]
     return merged
 
 
+def _head_gaze_region_overlay(
+    bbox: tuple[int, int, int, int],
+    frame_shape: tuple[int, int],
+    head_region_frac: float,
+) -> list[tuple[int, int, int, int, str]]:
+    """Gaze/face debug strip when GazeDetector is off: top ``head_region_frac`` of the person box."""
+    h_img, w_img = frame_shape
+    x1 = max(0, int(bbox[0]))
+    y1 = max(0, int(bbox[1]))
+    x2 = min(w_img, int(bbox[2]))
+    y2 = min(h_img, int(bbox[3]))
+    if x2 - x1 < 16 or y2 - y1 < 16:
+        return []
+    head_h = max(16, int((y2 - y1) * head_region_frac))
+    return [(x1, y1, x2, min(h_img, y1 + head_h), "HEAD")]
+
+
 def annotate_frame(
     frame: np.ndarray,
     tracks: dict,
@@ -208,6 +336,7 @@ def annotate_frame(
     zone_mgr: ZoneManager,
     fps: float,
     status_map: Optional[dict[int, str]] = None,
+    face_boxes_map: Optional[dict[int, list]] = None,
 ) -> np.ndarray:
     out = zone_mgr.draw(frame)
 
@@ -231,6 +360,31 @@ def annotate_frame(
         cv2.rectangle(out, (x1, y1 - th - 8), (x1 + tw + 6, y1), col, -1)
         cv2.putText(out, label, (x1 + 3, y1 - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # Separate face / head boxes for look-debugging (Haar FACE, MediaPipe MESH, or HEAD strip).
+        for item in (face_boxes_map or {}).get(tid, []):
+            if len(item) == 5:
+                fx1, fy1, fx2, fy2, tag = item
+            else:
+                fx1, fy1, fx2, fy2 = item
+                tag = "FACE"
+            if tag == "MESH":
+                col = (80, 220, 255)
+            elif tag == "HEAD":
+                col = (0, 140, 255)
+            else:
+                col = (0, 255, 255)
+            cv2.rectangle(out, (fx1, fy1), (fx2, fy2), col, 2)
+            cv2.putText(
+                out,
+                str(tag),
+                (fx1, max(16, fy1 - 4)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                col,
+                1,
+                cv2.LINE_AA,
+            )
 
     # HUD
     summary = funnel.summary()
@@ -296,6 +450,9 @@ def main():
 
     det_cfg = cfg.get("detector", {})
     shape_cfg = det_cfg.get("shape_filter", {})
+    human_filter_cfg = det_cfg.get("human_filter", {})
+    motion_filter_cfg = det_cfg.get("motion_filter", {})
+    runtime_cfg = cfg.get("runtime", {})
     detector = PersonDetector(
         weights=det_cfg.get("weights", "yolov8n.pt"),
         confidence=det_cfg.get("confidence", 0.4),
@@ -314,6 +471,7 @@ def main():
     approach_cfg = cfg.get("approach", {})
 
     gaze_cfg_raw = cfg.get("gaze", {})
+    head_region_frac_overlay = float(gaze_cfg_raw.get("head_region_frac", 0.35))
     gaze_detector: Optional[GazeDetector] = None
     if gaze_cfg_raw.get("enabled", True):
         gaze_detector = GazeDetector(
@@ -324,6 +482,9 @@ def main():
                 scale_factor=gaze_cfg_raw.get("scale_factor", 1.10),
                 min_neighbors=gaze_cfg_raw.get("min_neighbors", 2),
                 min_turn_offset_frac=gaze_cfg_raw.get("min_turn_offset_frac", 0.04),
+                use_mediapipe_headpose=gaze_cfg_raw.get("use_mediapipe_headpose", True),
+                strict_yaw_deg=gaze_cfg_raw.get("strict_yaw_deg", 16.0),
+                attention_yaw_deg=gaze_cfg_raw.get("attention_yaw_deg", 32.0),
             )
         )
 
@@ -408,7 +569,15 @@ def main():
     print(f"[telemetry] source={cfg['source']!r}  resolution={frame_w}x{frame_h}  fps_src={src_fps:.1f}")
 
     frame = first_frame
+    prev_gray: np.ndarray | None = None
     frame_count = 0
+    infer_every_n_frames = max(1, int(runtime_cfg.get("infer_every_n_frames", 1)))
+    upper_body_every_n_frames = max(1, int(runtime_cfg.get("upper_body_every_n_frames", 2)))
+    gaze_every_n_frames = max(1, int(runtime_cfg.get("gaze_every_n_frames", 2)))
+    last_detections: list[Detection] = []
+    last_looking_by_track: dict[int, bool] = {}
+    last_attention_by_track: dict[int, bool] = {}
+    last_face_boxes_by_track: dict[int, list[tuple[int, int, int, int]]] = {}
     t0 = time.time()
     fps_smoothed = 0.0
 
@@ -416,26 +585,52 @@ def main():
         while True:
             tick = time.time()
 
-            detections = detector.detect(frame)
-            if det_cfg.get("enable_upper_body_assist", True):
-                detections = merge_person_detections(
-                    detections,
-                    detect_upper_bodies(frame),
-                    iou_thr=det_cfg.get("upper_body_merge_iou", 0.45),
-                )
-            detections = [
-                d for d in detections
-                if is_human_shape(
-                    d,
-                    frame_shape=frame.shape[:2],
-                    min_aspect_ratio=shape_cfg.get("min_aspect_ratio", 0.75),
-                    max_aspect_ratio=shape_cfg.get("max_aspect_ratio", 4.8),
-                    min_area_frac=shape_cfg.get("min_area_frac", 0.003),
-                    max_area_frac=shape_cfg.get("max_area_frac", 0.55),
-                )
-            ]
-            for d in detections:
-                d.appearance_hist = clothing_histogram(frame, d)
+            if frame_count % infer_every_n_frames == 0:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                motion_mask: np.ndarray | None = None
+                if prev_gray is not None:
+                    delta = cv2.absdiff(gray, prev_gray)
+                    _, motion_mask = cv2.threshold(
+                        delta,
+                        int(motion_filter_cfg.get("pixel_delta_threshold", 18)),
+                        255,
+                        cv2.THRESH_BINARY,
+                    )
+                    # denoise tiny flicker
+                    motion_mask = cv2.medianBlur(motion_mask, 3)
+                prev_gray = gray
+
+                detections = detector.detect(frame)
+                if det_cfg.get("enable_upper_body_assist", True) and (frame_count % upper_body_every_n_frames == 0):
+                    detections = merge_person_detections(
+                        detections,
+                        detect_upper_bodies(frame),
+                        iou_thr=det_cfg.get("upper_body_merge_iou", 0.45),
+                    )
+                detections = [
+                    d for d in detections
+                    if is_human_shape(
+                        d,
+                        frame_shape=frame.shape[:2],
+                        min_aspect_ratio=shape_cfg.get("min_aspect_ratio", 0.75),
+                        max_aspect_ratio=shape_cfg.get("max_aspect_ratio", 4.8),
+                        min_area_frac=shape_cfg.get("min_area_frac", 0.003),
+                        max_area_frac=shape_cfg.get("max_area_frac", 0.55),
+                    )
+                ]
+                detections = [
+                    d for d in detections
+                    if strict_human_filter(frame, d, human_filter_cfg)
+                ]
+                detections = [
+                    d for d in detections
+                    if motion_evidence_filter(d, motion_mask, motion_filter_cfg)
+                ]
+                for d in detections:
+                    d.appearance_hist = clothing_histogram(frame, d)
+                last_detections = detections
+            else:
+                detections = last_detections
             # Privacy-protect footage before any writer/dashboard sees it.
             safe_frame = redact(frame, detections, privacy_cfg)
             tracks = tracker.update(detections, frame_shape=frame.shape[:2])
@@ -449,21 +644,58 @@ def main():
 
             looking_ids: set[int] = set()
             facing_camera_ids: set[int] = set()
+            attention_ids: set[int] = set()
+            face_boxes_by_track: dict[int, list[tuple[int, int, int, int]]] = {}
             if gaze_detector is not None:
+                run_gaze_this_frame = (frame_count % gaze_every_n_frames == 0)
                 for tid, t in tracks.items():
-                    det = Detection(
-                        x1=t.bbox[0], y1=t.bbox[1], x2=t.bbox[2], y2=t.bbox[3],
-                        confidence=t.confidence,
-                    )
-                    facing_camera = gaze_detector.is_looking(frame, det)
-                    if facing_camera:
+                    if run_gaze_this_frame:
+                        det = Detection(
+                            x1=t.bbox[0], y1=t.bbox[1], x2=t.bbox[2], y2=t.bbox[3],
+                            confidence=t.confidence,
+                        )
+                        (
+                            attention_intent,
+                            looked_strict,
+                            box_list,
+                        ) = gaze_detector.attention_look_and_face_boxes(frame, det)
+                        last_attention_by_track[tid] = attention_intent
+                        last_looking_by_track[tid] = looked_strict
+                        last_face_boxes_by_track[tid] = box_list
+                    else:
+                        attention_intent = last_attention_by_track.get(tid, False)
+                        looked_strict = last_looking_by_track.get(tid, False)
+
+                    if attention_intent:
+                        attention_ids.add(tid)
+                    if looked_strict:
                         facing_camera_ids.add(tid)
+                    face_boxes_by_track[tid] = last_face_boxes_by_track.get(tid, [])
                     # Product rule:
                     # LOOK = head toward camera, while NOT in active approach motion.
-                    looking = facing_camera and (tid not in approaching_ids)
+                    looking = looked_strict and (tid not in approaching_ids)
+                    funnel.note_attention(tid, attention_intent)
                     funnel.note_glance(tid, looking)
                     if looking:
                         looking_ids.add(tid)
+
+                active_tids = set(tracks.keys())
+                for tid in list(last_looking_by_track.keys()):
+                    if tid not in active_tids:
+                        del last_looking_by_track[tid]
+                for tid in list(last_attention_by_track.keys()):
+                    if tid not in active_tids:
+                        del last_attention_by_track[tid]
+                for tid in list(last_face_boxes_by_track.keys()):
+                    if tid not in active_tids:
+                        del last_face_boxes_by_track[tid]
+            else:
+                for tid, t in tracks.items():
+                    face_boxes_by_track[tid] = _head_gaze_region_overlay(
+                        (t.bbox[0], t.bbox[1], t.bbox[2], t.bbox[3]),
+                        frame.shape[:2],
+                        head_region_frac_overlay,
+                    )
 
             for tid in approaching_ids:
                 # Approach rule:
@@ -477,11 +709,19 @@ def main():
                     status_map[tid] = "APPROACHING"
                 elif tid in looking_ids:
                     status_map[tid] = "LOOKING"
+                elif tid in attention_ids:
+                    status_map[tid] = "ATTENDING"
                 else:
                     status_map[tid] = "PASSING_BY"
 
             annotated = annotate_frame(
-                safe_frame, tracks, funnel, zone_mgr, fps_smoothed, status_map=status_map
+                safe_frame,
+                tracks,
+                funnel,
+                zone_mgr,
+                fps_smoothed,
+                status_map=status_map,
+                face_boxes_map=face_boxes_by_track,
             )
 
             if video_writer is not None:

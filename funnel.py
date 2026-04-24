@@ -59,8 +59,14 @@ class FunnelState:
     look_count: int = 0
     _looking_now: bool = False
     _looking_streak: int = 0
+    attention_count: int = 0
+    _attending_now: bool = False
+    _attending_streak: int = 0
     # Per-zone accumulated dwell in seconds (handy for analytics)
-    counted_visitor: bool = False
+    counted_visitor: bool = False      # True ONLY when totals[VISITOR] was incremented
+    _visitor_gate_fired: bool = False  # True once the 1-second gate has been evaluated
+    _looker_counted: bool = False      # True once this track has been added to unique_lookers
+    last_foot_point: Optional[tuple[int, int]] = None  # updated every frame for deduplication
     seen_frames: int = 0
     foot_traffic_frames: int = 0
     first_foot_point: Optional[tuple[int, int]] = None
@@ -80,14 +86,9 @@ class FunnelTracker:
         zone_manager: ZoneManager,
         engagement_dwell_sec: float = 2.0,
         transaction_dwell_sec: float = 6.0,
-        visitor_dedupe_sec: float = 3.0,
-        visitor_dedupe_px: float = 90.0,
-        visitor_min_confidence: float = 0.45,
-        visitor_min_motion_px: float = 10.0,
-        visitor_min_seen_frames: int = 6,
-        visitor_min_foot_traffic_frames: int = 4,
-        visitor_min_displacement_px: float = 28.0,
-        visitor_min_path_px: float = 42.0,
+        visitor_dedupe_sec: float = 60.0,   # same person within 60 s = 1 count
+        visitor_dedupe_px: float = 500.0,   # same position within 500 px = 1 count
+        visitor_min_seen_frames: int = 4,   # must be in frame for ~0.3 s at 15 fps
         event_sink: Optional[EventSink] = None,
     ):
         """
@@ -108,12 +109,7 @@ class FunnelTracker:
         self.transaction_dwell_sec = transaction_dwell_sec
         self.visitor_dedupe_sec = visitor_dedupe_sec
         self.visitor_dedupe_px = visitor_dedupe_px
-        self.visitor_min_confidence = visitor_min_confidence
-        self.visitor_min_motion_px = visitor_min_motion_px
         self.visitor_min_seen_frames = visitor_min_seen_frames
-        self.visitor_min_foot_traffic_frames = visitor_min_foot_traffic_frames
-        self.visitor_min_displacement_px = visitor_min_displacement_px
-        self.visitor_min_path_px = visitor_min_path_px
         self.event_sink = event_sink or (lambda _: None)
 
         self.states: Dict[int, FunnelState] = {}
@@ -127,10 +123,14 @@ class FunnelTracker:
         }
         # Aggregate-only counters (no per-person retention required)
         self.unique_lookers: int = 0   # unique track ids that ever looked
+        self.unique_attention: int = 0  # unique track ids with attention intent
         self.click_count: int = 0      # button presses reported by the machine
         self.approached_ids: set[int] = set()  # active motion toward machine
-        # Recent visitor sightings for anti-double-counting when tracker IDs flicker.
+        # Recent sightings for anti-double-counting when tracker IDs flicker.
+        # Visitor: 10 s / 150 px window — coarser than before to handle face-bbox jitter.
+        # Looker:  15 s / 150 px window — same person looking continuously = 1 count.
         self._recent_visitor_points: deque[tuple[float, tuple[int, int]]] = deque(maxlen=300)
+        self._recent_looker_points:  deque[tuple[float, tuple[int, int]]] = deque(maxlen=300)
 
     def _is_duplicate_visitor(self, now: float, foot_point: tuple[int, int]) -> bool:
         # Drop stale sightings first.
@@ -142,22 +142,17 @@ class FunnelTracker:
                 return True
         return False
 
-    def _track_motion_px(self, track: Track) -> float:
-        if len(track.history) < 4:
-            return 0.0
-        x0, y0 = track.history[-4]
-        x1, y1 = track.history[-1]
-        return ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
-
-    def _track_path_px(self, track: Track) -> float:
-        if len(track.history) < 2:
-            return 0.0
-        total = 0.0
-        for i in range(1, len(track.history)):
-            x0, y0 = track.history[i - 1]
-            x1, y1 = track.history[i]
-            total += ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
-        return total
+    def _is_duplicate_looker(self, now: float, foot_point: tuple[int, int]) -> bool:
+        """Return True if this position was already counted as a looker recently."""
+        dedupe_sec = 60.0
+        dedupe_px  = 500.0
+        while self._recent_looker_points and now - self._recent_looker_points[0][0] > dedupe_sec:
+            self._recent_looker_points.popleft()
+        fx, fy = foot_point
+        for _, (px, py) in self._recent_looker_points:
+            if ((fx - px) ** 2 + (fy - py) ** 2) <= dedupe_px ** 2:
+                return True
+        return False
 
     def _emit(self, event_type: str, state: FunnelState, **extra) -> None:
         ev = {
@@ -204,45 +199,29 @@ class FunnelTracker:
             state = self.states[tid]
             state.last_seen_ts = now
             state.seen_frames += 1
+            state.last_foot_point = track.foot_point
             if state.first_foot_point is None:
                 state.first_foot_point = track.foot_point
             if ZoneManager.FOOT_TRAFFIC in zones_in:
                 state.foot_traffic_frames += 1
 
-            # Visitor counting gate: must be in foot_traffic, confident, and moving.
-            if not state.counted_visitor:
-                if ZoneManager.FOOT_TRAFFIC in zones_in and track.confidence >= self.visitor_min_confidence:
-                    motion_px = self._track_motion_px(track)
-                    path_px = self._track_path_px(track)
-                    disp_px = 0.0
-                    if state.first_foot_point is not None:
-                        fx, fy = state.first_foot_point
-                        cx, cy = track.foot_point
-                        disp_px = ((cx - fx) ** 2 + (cy - fy) ** 2) ** 0.5
-                    if (
-                        motion_px >= self.visitor_min_motion_px
-                        and state.seen_frames >= self.visitor_min_seen_frames
-                        and state.foot_traffic_frames >= self.visitor_min_foot_traffic_frames
-                        and disp_px >= self.visitor_min_displacement_px
-                        and path_px >= self.visitor_min_path_px
-                    ):
-                        is_duplicate = self._is_duplicate_visitor(now, track.foot_point)
-                        if not is_duplicate:
-                            state.counted_visitor = True
-                            self.totals[FunnelStage.VISITOR] += 1
-                            self._recent_visitor_points.append((now, track.foot_point))
-                            self._emit(
-                                "visitor_seen",
-                                state,
-                                foot_point=track.foot_point,
-                                zones=sorted(zones_in),
-                            )
-                        else:
-                            self._emit(
-                                "visitor_deduped",
-                                state,
-                                foot_point=track.foot_point,
-                            )
+            # ── Passed By gate ────────────────────────────────────────────────
+            # Fires on the FIRST stable detection (seen_frames >= 3, ~0.3 s at
+            # 10 fps). Green box appearing = Passed By increments immediately.
+            # Deduplication prevents the same person being counted again if
+            # their track ID flickers.
+            if not state._visitor_gate_fired:
+                if state.seen_frames >= 3 and ZoneManager.FOOT_TRAFFIC in zones_in:
+                    state._visitor_gate_fired = True
+                    fp        = track.foot_point
+                    is_dup    = self._is_duplicate_visitor(now, fp)
+                    is_looker = self._is_duplicate_looker(now, fp)
+                    if not is_dup and not is_looker:
+                        state.counted_visitor = True
+                        self.totals[FunnelStage.VISITOR] += 1
+                        self._recent_visitor_points.append((now, fp))
+                        self._emit("visitor_seen", state,
+                                   foot_point=fp, zones=sorted(zones_in))
 
             # Track distance metrics (NaN-safe min)
             if d is not None and d == d:  # not NaN
@@ -305,10 +284,17 @@ class FunnelTracker:
     # ── Glance / "looking at machine" tracking ─────────────────────────────
 
     def note_glance(self, track_id: int, looking: bool, now: Optional[float] = None) -> None:
-        """Called by the gaze module each frame with the per-track gaze
-        decision. We hysteresis-debounce by counting one glance per
-        on-edge transition (looking=False -> True), so a continuous
-        stare counts as ONE glance, not 30/sec.
+        """Record a per-frame gaze decision for one track.
+
+        One edge (False→True over 2 consecutive frames) = one glance event.
+
+        New funnel order: Passed By → Approached → Looked At
+        Approach is a PREREQUISITE for Looked At — a person who looks at the
+        camera but hasn't been tracked approaching is shown as LOOKING visually
+        but NOT counted in unique_lookers until they approach first.
+
+        _looking_now is always updated so the box color reflects reality;
+        the counter gate only applies to unique_lookers.
         """
         state = self.states.get(track_id)
         if state is None:
@@ -317,29 +303,59 @@ class FunnelTracker:
             state._looking_streak += 1
         else:
             state._looking_streak = 0
-        # Require a tiny temporal confirmation window (2 frames) to reduce
-        # cascade jitter while still being responsive.
+
+        # 2-frame confirmation window — eliminates single-frame jitter
         confirmed_looking = state._looking_streak >= 2
         if confirmed_looking and not state._looking_now:
             state.look_count += 1
-            if state.look_count == 1 and state.counted_visitor:
-                self.unique_lookers += 1
+            if state.look_count == 1 and not state._looker_counted:
+                _now = now or time.time()
+                fp   = state.last_foot_point or state.first_foot_point
+                if fp is None or not self._is_duplicate_looker(_now, fp):
+                    self.unique_lookers += 1
+                    if fp:
+                        self._recent_looker_points.append((_now, fp))
+                    # Yellow box = Looked At counted = also counts as Passed By.
+                    # Bypass the 1-second gate so the two are always in sync.
+                    if not state.counted_visitor:
+                        state.counted_visitor = True
+                        state._visitor_gate_fired = True
+                        if fp and not self._is_duplicate_visitor(_now, fp):
+                            self.totals[FunnelStage.VISITOR] += 1
+                            self._recent_visitor_points.append((_now, fp))
+                state._looker_counted = True
             self._emit("glance", state, look_count=state.look_count)
         state._looking_now = confirmed_looking
 
-    def note_approach_motion(self, track_id: int) -> None:
-        """Count approach only after at least one look event.
+    def note_attention(self, track_id: int, attentive: bool) -> None:
+        """Track broader attention intent (stable proxy metric)."""
+        state = self.states.get(track_id)
+        if state is None:
+            return
+        if attentive:
+            state._attending_streak += 1
+        else:
+            state._attending_streak = 0
+        confirmed = state._attending_streak >= 2
+        if confirmed and not state._attending_now:
+            state.attention_count += 1
+            if state.attention_count == 1 and state.counted_visitor:
+                self.unique_attention += 1
+            self._emit("attention", state, attention_count=state.attention_count)
+        state._attending_now = confirmed
 
-        This enforces the product rule:
-          looked_at (head movement) should be >= approached (full-body movement).
+    def note_approach_motion(self, track_id: int) -> None:
+        """Count approach motion for a track.
+
+        Funnel order: Passed By → Looked At → Approached
+        A look event (frontal face toward camera) is required before
+        approach is credited — this ensures Approached ≤ Looked At.
         """
         state = self.states.get(track_id)
         if state is None:
             return
         if state.look_count <= 0:
-            return
-        if not state.counted_visitor:
-            return
+            return   # must have looked at the machine first
         if track_id in self.approached_ids:
             return
         self.approached_ids.add(track_id)
@@ -396,23 +412,23 @@ class FunnelTracker:
         #   approached   = unique people who reached engagement (close)
         #   clicked      = button presses reported by the machine
         #   purchased    = converted transactions (POS-confirmed if wired)
-        v = self.totals[FunnelStage.VISITOR]
-        e = self.totals[FunnelStage.ENGAGED]
-        c = self.totals[FunnelStage.CONVERTED]
+        v  = self.totals[FunnelStage.VISITOR]
+        e  = self.totals[FunnelStage.ENGAGED]
+        c  = self.totals[FunnelStage.CONVERTED]
         ul = self.unique_lookers
         clicks = self.click_count
-        # If motion-based approach detection is wired, use it; otherwise
-        # fall back to ENGAGED for backward compatibility.
-        approached_raw = len(self.approached_ids) if self.approached_ids else e
-        approached = min(approached_raw, ul)
+        # Enforce funnel ordering: passed_by >= looked_at >= approached
+        looked_at  = min(ul, v)
+        approached = min(len(self.approached_ids) if self.approached_ids else e,
+                         looked_at)
         return {
-            "passed_by": v,
-            "looked_at": ul,
+            "passed_by":  v,
+            "looked_at":  looked_at,
             "approached": approached,
-            "clicked": clicks,
-            "purchased": c,
-            "look_rate":        round(ul / v, 4) if v else 0.0,    # of passed-by
-            "approach_rate":    round(approached / v, 4) if v else 0.0,
+            "clicked":    clicks,
+            "purchased":  c,
+            "look_rate":        round(looked_at / v, 4) if v else 0.0,
+            "approach_rate":    round(approached / looked_at, 4) if looked_at else 0.0,
             "click_rate":       round(clicks / approached, 4) if approached else 0.0,
             "purchase_rate":    round(c / approached, 4) if approached else 0.0,
             "overall_conversion": round(c / v, 4) if v else 0.0,
