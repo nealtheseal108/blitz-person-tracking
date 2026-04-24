@@ -18,8 +18,8 @@ detector:
   device: null     # null = auto, "cpu", "cuda:0", "mps"
 
 tracker:
-  max_disappeared: 1     # box dies within 1 frame of person leaving
-  max_distance: 200
+  max_disappeared: 5     # ~0.5s buffer — survives YOLO misses mid-walk, dies when truly gone
+  max_distance: 350      # raised so fast-moving people don't spawn duplicate tracks
 
 funnel:
   engagement_dwell_sec: 2.0

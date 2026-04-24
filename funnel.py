@@ -65,7 +65,9 @@ class FunnelState:
     # Per-zone accumulated dwell in seconds (handy for analytics)
     counted_visitor: bool = False      # True ONLY when totals[VISITOR] was incremented
     _visitor_gate_fired: bool = False  # True once the 1-second gate has been evaluated
+    _visitor_counted_ts: float = 0.0   # wall-clock time when P was counted
     _looker_counted: bool = False      # True once this track has been added to unique_lookers
+    _looker_counted_ts: float = 0.0    # wall-clock time when L was counted
     last_foot_point: Optional[tuple[int, int]] = None  # updated every frame for deduplication
     seen_frames: int = 0
     foot_traffic_frames: int = 0
@@ -206,12 +208,11 @@ class FunnelTracker:
                 state.foot_traffic_frames += 1
 
             # ── Passed By gate ────────────────────────────────────────────────
-            # Fires on the FIRST stable detection (seen_frames >= 3, ~0.3 s at
-            # 10 fps). Green box appearing = Passed By increments immediately.
-            # Deduplication prevents the same person being counted again if
-            # their track ID flickers.
+            # Fires once the track has been alive for >= 10 frames (~1 s at
+            # 10 fps). Short-lived ghost tracks and YOLO flickers never reach
+            # this threshold, so they can't inflate the counter.
             if not state._visitor_gate_fired:
-                if state.seen_frames >= 3 and ZoneManager.FOOT_TRAFFIC in zones_in:
+                if state.seen_frames >= 10 and ZoneManager.FOOT_TRAFFIC in zones_in:
                     state._visitor_gate_fired = True
                     fp        = track.foot_point
                     is_dup    = self._is_duplicate_visitor(now, fp)

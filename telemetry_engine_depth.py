@@ -49,7 +49,7 @@ from depth_source import colorize_depth, open_depth_source, sample_depth
 from depth_detector import DepthPersonDetector
 from detector import Detection, PersonDetector
 from face_detector import FaceDetector
-from funnel import FunnelTracker
+from funnel import FunnelStage, FunnelTracker
 from gaze import GazeConfig, GazeDetector
 from privacy import PrivacyConfig, redact_inplace
 from tracker import CentroidTracker, Track
@@ -434,11 +434,14 @@ def _draw_three_layer_annotations(
         dist = distances.get(tid)
         dist_str = f" {dist:.1f}m" if dist is not None and np.isfinite(dist) else ""
 
-        # Counted-stage flags: P=passed_by  A=approached  L=looked_at
-        p_flag = "P" if (state and state.counted_visitor)  else "-"
-        a_flag = "A" if tid in funnel.approached_ids        else "-"
-        l_flag = "L" if (state and state._looker_counted)  else "-"
-        flags  = f" {p_flag}{a_flag}{l_flag}"
+        # Flags enforce prereq chain: P → L → A
+        has_p  = state is not None and state._visitor_gate_fired
+        has_l  = has_p and state._looker_counted
+        has_a  = has_l and tid in funnel.approached_ids
+        p_flag = "P" if has_p else "-"
+        l_flag = "L" if has_l else "-"
+        a_flag = "A" if has_a else "-"
+        flags  = f" {p_flag}{l_flag}{a_flag}"
 
         full_label = f"#{tid} {label_text}{dist_str}{flags}"
 
@@ -507,7 +510,7 @@ def run_webcam_mode(
         raise SystemExit(f"Haar cascade not found at {_haar_path}")
 
     tracker = CentroidTracker(
-        max_disappeared=cfg.get("tracker", {}).get("max_disappeared", 1),
+        max_disappeared=cfg.get("tracker", {}).get("max_disappeared", 5),
         max_distance=cfg.get("tracker", {}).get("max_distance", 200),
     )
 
@@ -543,12 +546,33 @@ def run_webcam_mode(
 
             # ── 1. Layer 1: detect bodies (YOLO every frame at imgsz=160) ────
             _raw = body_detector.detect(frame)
-            body_dets = [
+            _sane = [
                 d for d in _raw
                 if (d.x2 - d.x1) >= 40
                 and (d.y2 - d.y1) / max(d.x2 - d.x1, 1) <= 5.0
                 and (d.x2 - d.x1) * (d.y2 - d.y1) <= 0.80 * frame_area
             ]
+            # IoU NMS: if two boxes overlap > 0.3, keep the higher-confidence one.
+            # YOLO has internal NMS but at imgsz=160 the same person can still
+            # produce two slightly different boxes that pass YOLO's gate.
+            _sane.sort(key=lambda d: d.confidence, reverse=True)
+            body_dets: list = []
+            for cand in _sane:
+                ca = (cand.x2 - cand.x1) * (cand.y2 - cand.y1)
+                keep = True
+                for kept in body_dets:
+                    ix1 = max(cand.x1, kept.x1); iy1 = max(cand.y1, kept.y1)
+                    ix2 = min(cand.x2, kept.x2); iy2 = min(cand.y2, kept.y2)
+                    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                    if inter == 0:
+                        continue
+                    ka  = (kept.x2 - kept.x1) * (kept.y2 - kept.y1)
+                    iou = inter / (ca + ka - inter + 1e-6)
+                    if iou > 0.30:
+                        keep = False
+                        break
+                if keep:
+                    body_dets.append(cand)
 
             # ── 2. Track body centroids ───────────────────────────────────────
             tracks = tracker.update(body_dets, frame_shape=frame.shape)
@@ -578,11 +602,15 @@ def run_webcam_mode(
             funnel.update(tracks, distances_m=distances)
 
             # ── 6. Layer 2: approach detection ────────────────────────────────
+            # P → L → A enforced here: orange box only appears AFTER yellow
+            # (looked at) has already fired for this track.
             approaching_ids: set = set()
             for tid in tracks:
                 if is_distance_decreasing(_dist_history.get(tid, [])):
-                    approaching_ids.add(tid)
-                    funnel.note_approach_motion(tid)
+                    state = funnel.states.get(tid)
+                    if state is not None and state._looker_counted:
+                        approaching_ids.add(tid)
+                        funnel.note_approach_motion(tid)
 
             # ── 7. Layer 3: Haar frontal face detection ───────────────────────
             # Downscale to half res for speed; scale coords back up after.
@@ -631,9 +659,9 @@ def run_webcam_mode(
                 funnel.note_glance(tid, tid in looking_tids)
 
             # ── 8. Sync counters + flags directly to box color ────────────────
-            # Box color is the source of truth.
-            # Yellow → L flag + Looked At increments immediately.
-            # Orange → A flag + Approached increments immediately.
+            # Box color is the source of truth.  P → L → A with a 0.5 s
+            # enforced gap between each stage transition.
+            _STAGE_GAP = 0.5   # seconds required between P→L and L→A
             _now = time.time()
             for tid in tracks:
                 state = funnel.states.get(tid)
@@ -641,19 +669,35 @@ def run_webcam_mode(
                     continue
                 is_yellow = tid in looking_tids
                 is_orange = (not is_yellow) and (tid in approaching_ids)
+                is_green  = not is_yellow and not is_orange
 
-                # Green must exist before yellow can count
-                if is_yellow and state.counted_visitor and not state._looker_counted:
+                # Green box → P fires (no delay needed, this is the base stage)
+                if is_green and state._visitor_gate_fired and not state.counted_visitor:
+                    funnel.totals[FunnelStage.VISITOR] += 1
                     fp = state.last_foot_point or state.first_foot_point
-                    if fp is None or not funnel._is_duplicate_looker(_now, fp):
-                        funnel.unique_lookers += 1
-                        if fp:
-                            funnel._recent_looker_points.append((_now, fp))
+                    if fp:
+                        funnel._recent_visitor_points.append((_now, fp))
+                    state.counted_visitor = True
+                    state._visitor_counted_ts = _now
+
+                # Yellow box → L fires only if P fired at least 0.5 s ago
+                if (is_yellow
+                        and state.counted_visitor
+                        and not state._looker_counted
+                        and (_now - state._visitor_counted_ts) >= _STAGE_GAP):
+                    funnel.unique_lookers += 1
+                    fp = state.last_foot_point or state.first_foot_point
+                    if fp:
+                        funnel._recent_looker_points.append((_now, fp))
                     state._looker_counted = True
+                    state._looker_counted_ts = _now
                     state._looking_now = True
 
-                # Yellow must exist before orange can count
-                if (is_yellow or is_orange) and state._looker_counted and tid not in funnel.approached_ids:
+                # Orange box → A fires only if L fired at least 0.5 s ago
+                if ((is_yellow or is_orange)
+                        and state._looker_counted
+                        and tid not in funnel.approached_ids
+                        and (_now - state._looker_counted_ts) >= _STAGE_GAP):
                     funnel.approached_ids.add(tid)
 
             annotated = _draw_three_layer_annotations(
